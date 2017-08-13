@@ -2,7 +2,7 @@
 #include <stdlib.h>
 #include "asoundlib.h"
 
-#define AVB_TEST_NUM_FRAMES_IN_BUFFER 1024
+#define AVB_TEST_NUM_FRAMES_IN_BUFFER 2048
 #define AVB_TEST_NUM_BYTES_IN_BUFFER  (AVB_TEST_NUM_FRAMES_IN_BUFFER * 2 * 2) /* 2 channels, 2 bytes per sample */
 
 #pragma pack(push, 1)
@@ -83,6 +83,7 @@ int startPlayback(int maxFrames, char* filename)
 	int readFrames = 0;
 	snd_pcm_t *handle;
 	struct wavhdr hdr;
+	snd_hwdep_t* hwdep;
 	snd_pcm_uframes_t ringbufsize;
  	snd_pcm_uframes_t periodsize;
 	struct timespec t1, t2, d;
@@ -113,7 +114,12 @@ int startPlayback(int maxFrames, char* filename)
                 return -1;
 	}
 
-	if ((err = snd_pcm_open(&handle, "default", SND_PCM_STREAM_PLAYBACK, 0)) < 0) {
+	if ((err = snd_hwdep_open(&hwdep, "hw:avb", SND_HWDEP_OPEN_DUPLEX)) < 0) {
+		printf("Playback hwdep open error: %s\n", snd_strerror(err));
+		return -1;	
+	} 
+
+	if ((err = snd_pcm_open(&handle, "hw:CARD=avb,0", SND_PCM_STREAM_PLAYBACK, 0)) < 0) {
 		printf("Playback open error: %s\n", snd_strerror(err));
 		return -1;
         }
@@ -135,6 +141,8 @@ int startPlayback(int maxFrames, char* filename)
 		readBytes  = readFrames * hdr.numchannels * (hdr.bps / 8);
 
 		fread((void*)&buf[0], readBytes, 1, fp);
+
+		snd_hwdep_ioctl(hwdep, 0, (void*)t1.tv_nsec);
 
 		sentFrames = snd_pcm_writei(handle, &buf[0], readFrames);
 
@@ -172,15 +180,19 @@ int startRecord(int maxFrames, char* filename)
 	FILE* fi;
 	int numFrames = 0;
 	int readBytes = 0;
-	int rcvdBytes = 0;
+	int rcvdFrames = 0;
 	int readFrames = 0;
 	snd_pcm_t *handle;
 	struct wavhdr hdr;
+	unsigned long ts;
+	snd_hwdep_t* hwdep;
+	snd_pcm_uframes_t ringbufsize;
+ 	snd_pcm_uframes_t periodsize;
 
 	hdr.chunkid[0] = 'R'; hdr.chunkid[1] = 'I'; hdr.chunkid[2] = 'F'; hdr.chunkid[3] = 'F';
 	hdr.format[0] = 'W'; hdr.format[1] = 'A'; hdr.format[2] = 'V'; hdr.format[3] = 'E';
 	hdr.fmtid[0] = 'f'; hdr.fmtid[1] = 'm'; hdr.fmtid[2] = 't'; hdr.fmtid[3] = ' ';
-	hdr.chunkid[0] = 'd'; hdr.chunkid[1] = 'a'; hdr.chunkid[2] = 't'; hdr.chunkid[3] = 'a';
+	hdr.dataid[0] = 'd'; hdr.dataid[1] = 'a'; hdr.dataid[2] = 't'; hdr.dataid[3] = 'a';
 	hdr.audioformat = 1; hdr.bps = 16; hdr.numchannels = 2; 
 	hdr.blockalign = 4; hdr.samplerate = 48000; hdr.byterate = ((hdr.numchannels * (hdr.bps / 8)) * hdr.samplerate);
 
@@ -191,39 +203,64 @@ int startRecord(int maxFrames, char* filename)
                 return -1;
 	}
 
-	if ((err = snd_pcm_open(&handle, "default", SND_PCM_STREAM_PLAYBACK, 0)) < 0) {
-		printf("Playback open error: %s\n", snd_strerror(err));
+	if ((err = snd_hwdep_open(&hwdep, "hw:avb", SND_HWDEP_OPEN_DUPLEX)) < 0) {
+		printf("Playback hwdep open error: %s\n", snd_strerror(err));
+		return -1;	
+	} 
+
+	if ((err = snd_pcm_open(&handle, "hw:CARD=avb,0", SND_PCM_STREAM_CAPTURE, 0)) < 0) {
+		printf("Record open error: %s\n", snd_strerror(err));
 		return -1;
         }
 
 	if ((err = snd_pcm_set_params(handle, SND_PCM_FORMAT_S16_LE, SND_PCM_ACCESS_RW_INTERLEAVED, hdr.numchannels, hdr.samplerate, 0, 100000)) < 0) {
-		printf("Playback opset params error: %s\n", snd_strerror(err));
+		printf("Record opset params error: %s\n", snd_strerror(err));
 		return -1;
         }
+
+	if ((err = snd_pcm_prepare (handle)) < 0) {
+		printf ("Record cannot prepare audio interface for use (%s) %d\n", snd_strerror(err), err);
+		return -1;
+	}
+
+	snd_pcm_get_params(handle, &ringbufsize, &periodsize);
+	printf("Playback params ringbufsize: %li, periodsize: %li\n", ringbufsize, periodsize);
+
+	snd_pcm_start(handle);
 
 	while(numFrames < maxFrames) {
 		readFrames = (((maxFrames - numFrames) > AVB_TEST_NUM_FRAMES_IN_BUFFER)?(AVB_TEST_NUM_FRAMES_IN_BUFFER):(maxFrames - numFrames));
 		readBytes  = readFrames * hdr.numchannels * (hdr.bps / 8);
 
-		rcvdBytes = snd_pcm_readi(handle, &buf[0], readBytes);
+		printf("Record reading %d frames", readFrames);
 
-		if (rcvdBytes < 0)
-			rcvdBytes = snd_pcm_recover(handle, rcvdBytes, 0);
-		if (rcvdBytes < 0) {
-			printf("snd_pcm_readi failed: %s (%d)\n", snd_strerror(rcvdBytes), rcvdBytes);
+		rcvdFrames = snd_pcm_readi(handle, &buf[0], readFrames);
+
+		if (rcvdFrames < 0) {
+			rcvdFrames = snd_pcm_recover(handle, rcvdFrames, 0);
+			snd_pcm_start(handle);
+			continue;
+		}
+		if (rcvdFrames < 0) {
+			printf("snd_pcm_readi failed: %s (%d)\n", snd_strerror(rcvdFrames), rcvdFrames);
 			break;
 		}
 
-		if ((rcvdBytes > 0) && (rcvdBytes < readBytes))
-			printf("Short read (expected %d, read %d)\n", readBytes, rcvdBytes);
+		if ((rcvdFrames > 0) && (rcvdFrames < readFrames))
+			printf("Short read (expected %d, read %d)\n", readFrames, rcvdFrames);
 
-		fwrite((void*)&buf[0], rcvdBytes, 1, fp);
+		snd_hwdep_ioctl(hwdep, 1, (void*)&ts);
+		printf(" - Record read ts %d \n", ts);
 
-		numFrames += (rcvdBytes / (hdr.numchannels * (hdr.bps / 8)));
+		fwrite((void*)&buf[0], 1, readBytes, fp);
+
+		numFrames += rcvdFrames;
 	}
 
+	snd_pcm_drop(handle);
+
 	hdr.fmtsize = 16; hdr.datasize = ((hdr.numchannels * (hdr.bps / 8)) * numFrames); hdr.chunksize = 36 + hdr.datasize;
-	printf("Record received %d frames: %d\n", numFrames);
+	printf("Record received %d frames\n", numFrames);
 
 	snd_pcm_close(handle);
 	fflush(fp);
@@ -239,9 +276,9 @@ int startRecord(int maxFrames, char* filename)
 
 	fwrite((void*)&hdr, sizeof(struct wavhdr), 1, fp);
 
-	while((ferror(fp) == 0) && (feof(fp) == 0)) {
-		fread((void*)&buf[0], AVB_TEST_NUM_BYTES_IN_BUFFER, 1, fi);
-		fwrite((void*)&buf[0], AVB_TEST_NUM_BYTES_IN_BUFFER, 1, fp);
+	while((ferror(fi) == 0) && (feof(fi) == 0)) {
+		readBytes = fread((void*)&buf[0], 1, AVB_TEST_NUM_BYTES_IN_BUFFER, fi);
+		fwrite((void*)&buf[0], 1, readBytes, fp);
 	}
 
 	fclose(fi);

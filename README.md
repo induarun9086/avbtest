@@ -1,8 +1,8 @@
 # avbtest
 
-Test application for the ALSA AVB driver
+Test application for the ALSA AVB driver. 
 
-Usage: `avbtest -t|-r <numframes> <file>`
+**Usage** `avbtest -t|-r <numframes> <file>`
 
 * Transmit mode (-t)
 
@@ -28,4 +28,16 @@ Usage: `avbtest -t|-r <numframes> <file>`
    * Load the driver using insmod.
    * The driver depends on the ALSA hardware dependent interface
    * The snd-hwdep.ko module has to be loaded before AVB driver can be loaded.
+   
+* The gPTPd daemon has to running to test the synchronized audio streaming over AVB
+
+   * The gPTP deamon is found in the following repo
+   * https://github.com/induarun9086/gPTPd
+   * The build and executions instructions are in the above repo.
+   
+**Test Environment**
+
+* 2 Beagle bone blacks connected togther with a cross ehternet cable.
+* The beagle bone black in the transmit mode should have a analog audio card connected.
+* 2 Channels of the analog audio card are connected to a test PC.
 

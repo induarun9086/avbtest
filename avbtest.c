@@ -1,62 +1,98 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <pthread.h>
+#include <sched.h>
 #include "asoundlib.h"
 
-#define AVB_TEST_AVB_PLAYBACK_THREAD     0
-#define AVB_TEST_ANALOG_PLAYBACK_THREAD  1
-#define AVB_TEST_AVB_RECORD_THREAD       2
-#define AVB_TEST_MAX_NUMBER_THREADS      3
+#define TWO_POW_32 ((unsigned long long)4294967296)
 
-#define AVB_TEST_MAX_FILE_NAME_SIZE   1024
-#define AVB_TEST_MAX_DEV_NAME_SIZE    256
-#define AVB_TEST_MAX_HWDEP_NAME_SIZE  256
-#define AVB_TEST_NUM_FRAMES_IN_BUFFER 2048
+#define T0    0
+#define T1    1
+#define T2    2
+#define T3    3
+#define T4    4
+#define AVB_TEST_MAX_NUMBER_THREADS 5
+
+#define AVB_TEST_MODE_AVB_PLAYBACK       0
+#define AVB_TEST_MODE_AVB_RECORD         1
+#define AVB_TEST_MODE_AVB_DEMO_TX        2
+#define AVB_TEST_MODE_AVB_DEMO_RX        3
+
+#define AVB_TEST_MAX_FILE_NAME_SIZE    1024
+#define AVB_TEST_MAX_DEV_NAME_SIZE     256
+#define AVB_TEST_MAX_HWDEP_NAME_SIZE   256
+#define AVB_TEST_NUM_FRAMES_IN_BUFFER  8192
 #define AVB_TEST_NUM_BYTES_IN_BUFFER  (AVB_TEST_NUM_FRAMES_IN_BUFFER * 2 * 2) /* 2 channels, 2 bytes per sample */
+
+#define AVB_TEST_AUD_BUFFER_NUM_FRAMES  (4 * 48000) /* for 4 seconds @ 48000 HZ */
+#define AVB_TEST_AUD_BUFFER_SIZE        (AVB_TEST_AUD_BUFFER_NUM_FRAMES * 2 * 2) /* 2 channels, 2 bytes per sample */
 
 #pragma pack(push, 1)
 
 struct wavhdr {
-	char chunkid[4];
-	int chunksize;
-	char format[4];
-	char fmtid[4];
-	int fmtsize;
-	short int audioformat;
-	short int numchannels;
-	int samplerate;
-	int byterate;
-	short int blockalign;
-	short int bps;
-	char dataid[4];
-	int datasize;
+    char chunkid[4];
+    int chunksize;
+    char format[4];
+    char fmtid[4];
+    int fmtsize;
+    short int audioformat;
+    short int numchannels;
+    int samplerate;
+    int byterate;
+    short int blockalign;
+    short int bps;
+    char dataid[4];
+    int datasize;
 };
 
 #pragma pack(pop)
 
-struct threadargs {
-	int id;
-	int res;
-	int maxframes;
-	char filename[AVB_TEST_MAX_FILE_NAME_SIZE];
-	char devname[AVB_TEST_MAX_DEV_NAME_SIZE];
-	char hwdepname[AVB_TEST_MAX_HWDEP_NAME_SIZE];
+struct avbtestcfg {
+    int mode;
+    int clkId;
+    int maxframes;
+    int numchannels;
+    unsigned char sync;
+    unsigned char tobuf;
+    unsigned char timestamp;
+    char filename[AVB_TEST_MAX_FILE_NAME_SIZE];
+    char devname[AVB_TEST_MAX_DEV_NAME_SIZE];
+    char hwdepname[AVB_TEST_MAX_HWDEP_NAME_SIZE];
 };
 
+struct threadargs {
+    int id;
+    int res;
+    struct avbtestcfg cfg;
+};
+
+unsigned int syncts = 0;
+int currTxIdx = 0;
+int currRxIdx = 0;
+int audbufsize = 0;
+struct timespec synctime = {0};
+unsigned char playbackDone = 0;
 pthread_t tids[AVB_TEST_MAX_NUMBER_THREADS] = {0};
+pthread_attr_t tattrs[AVB_TEST_MAX_NUMBER_THREADS] = {0};
 struct threadargs targs[AVB_TEST_MAX_NUMBER_THREADS] = {0};
+unsigned char audbuf[AVB_TEST_AUD_BUFFER_SIZE] = {0};
+unsigned char buf[AVB_TEST_MAX_NUMBER_THREADS][AVB_TEST_NUM_BYTES_IN_BUFFER] = {0};
 
+void printUsage(void);
+void waitForThreads(int num);
+unsigned int getAVTPTs(struct timespec* t);
+void* startRecord(void* argument);
 void* startPlayback(void* argument);
-int startRecord(int maxFrames, char* filename);
-void timespec_diff(struct timespec *start, struct timespec *stop,
-                   struct timespec *result);
+void getAVTPSt(unsigned int ts, struct timespec* st);
+void setThreadPrio(pthread_attr_t* ptattrs, int prio);
+void timespec_sum(struct timespec *a, struct timespec *b);
+int parseargs(int argc, char* argv[], struct avbtestcfg* cfg);
+void timespec_diff(struct timespec *start, struct timespec *stop, struct timespec *result);
+void initAndStartThread(int id, int prio, struct avbtestcfg* cfg, void* fn, unsigned char tobuf);
 
-unsigned char buf[AVB_TEST_NUM_BYTES_IN_BUFFER];
-
-void timespec_diff(struct timespec *start, struct timespec *stop,
-                   struct timespec *result)
+void timespec_diff(struct timespec *start, struct timespec *stop, struct timespec *result)
 {
-    if ((stop->tv_nsec - start->tv_nsec) < 0) {
+    if((stop->tv_nsec - start->tv_nsec) < 0) {
         result->tv_sec = stop->tv_sec - start->tv_sec - 1;
         result->tv_nsec = stop->tv_nsec - start->tv_nsec + 1000000000;
     } else {
@@ -67,281 +103,504 @@ void timespec_diff(struct timespec *start, struct timespec *stop,
     return;
 }
 
+void timespec_sum(struct timespec *a, struct timespec *b)
+{
+    if((a->tv_nsec + b->tv_nsec) > 1000000000) {
+        a->tv_sec = a->tv_sec + b->tv_sec + 1;
+        a->tv_nsec = (a->tv_nsec + b->tv_nsec) - 1000000000;
+    } else {
+        a->tv_sec = a->tv_sec + b->tv_sec;
+        a->tv_nsec = a->tv_nsec + b->tv_nsec;
+    }
+
+    return;
+}
+
+unsigned int getAVTPTs(struct timespec* t)
+{
+    unsigned long long ts;
+
+    ts = t->tv_nsec;
+    ts += ((unsigned long long)t->tv_sec * 1000000000);
+    ts %= TWO_POW_32;
+
+    return (unsigned int)ts;
+}
+
+void getAVTPSt(unsigned int ts, struct timespec* st)
+{
+    unsigned int currtime = getAVTPTs(st);
+    unsigned int diff = ((ts > currtime)?(ts - currtime):((TWO_POW_32 - currtime) + ts));
+
+    printf("t: syncts: %lu currts: %lu diff: %lu \n", ts, currtime, diff);
+
+    st->tv_sec  += diff / 1000000000;
+    st->tv_nsec += diff % 1000000000;
+    st->tv_sec  += ((st->tv_nsec >= 1000000000)?(1):(0));
+    st->tv_nsec -= ((st->tv_nsec >= 1000000000)?(1000000000):(0));
+}
+
+void setThreadPrio(pthread_attr_t* ptattrs, int prio)
+{
+    struct sched_param param;
+
+    pthread_attr_init(ptattrs);
+    pthread_attr_getschedparam(ptattrs, &param);
+    param.sched_priority = prio;
+    pthread_attr_setschedparam(ptattrs, &param);
+}
+
+void printUsage(void) {
+    printf("Usage: avbtest {-p|-r|-a|-b} <filename> -n <number of frames> -d <devicename> \n");
+}
+
+int parseargs(int argc, char* argv[], struct avbtestcfg* cfg)
+{
+    int i;
+
+    memset(cfg, 0, sizeof(struct avbtestcfg));
+
+    cfg->maxframes = -1;
+    cfg->numchannels = 2;
+    cfg->mode = AVB_TEST_MODE_AVB_PLAYBACK;
+    memcpy(&cfg->hwdepname[0], "hw:avb", strlen("hw:avb"));
+
+    for(i = 1; i < argc; i++) {
+        if(argv[i][0] == '-') {
+            switch(argv[i][1]) {
+                case 'p':
+                    cfg->mode = AVB_TEST_MODE_AVB_PLAYBACK;
+                    sscanf(&argv[(++i)][0], "%s", cfg->filename);
+                    break;
+                case 'r':
+                    cfg->mode = AVB_TEST_MODE_AVB_RECORD;
+                    sscanf(&argv[(++i)][0], "%s", cfg->filename);
+                    break;
+                case 'a':
+                    cfg->mode = AVB_TEST_MODE_AVB_DEMO_TX;
+                    sscanf(&argv[(++i)][0], "%s", cfg->filename);
+                    break;
+                case 'b':
+                    cfg->mode = AVB_TEST_MODE_AVB_DEMO_RX;
+                    sscanf(&argv[(++i)][0], "%s", cfg->filename);
+                    break;
+                case 'n':
+                    sscanf(&argv[++i][0], "%d", &cfg->maxframes);
+                    break;
+                case 'd':
+                    sscanf(&argv[++i][0], "%s", cfg->devname);
+                    break;
+                case 't':
+                    cfg->timestamp = 1;
+                    break;
+                case 's':
+                    cfg->sync = 1; /* Sync to the next exact second (no fractional seconds) that is a multiple of 3 */
+                    break;
+                default:
+                    break;
+            }
+        }
+    }
+
+    if(cfg->devname[0] == 0) {
+        if((cfg->mode == AVB_TEST_MODE_AVB_PLAYBACK) || (cfg->mode == AVB_TEST_MODE_AVB_DEMO_TX) || (cfg->mode == AVB_TEST_MODE_AVB_RECORD))
+            memcpy(&cfg->devname[0], "hw:CARD=avb,0", strlen("hw:CARD=avb,0")+1);
+        else
+            memcpy(&cfg->devname[0], "hw:CARD=C8CH,0", strlen("hw:CARD=C8CH,0")+1);
+    }
+}
+
+void initAndStartThread(int id, int prio, struct avbtestcfg* cfg, void* fn, unsigned char tobuf)
+{
+    memset(&targs[id], 0, sizeof(struct threadargs));
+    targs[id].id = id; targs[id].res = 0; cfg->tobuf = tobuf;
+    memcpy(&targs[id].cfg, cfg, sizeof(struct avbtestcfg));
+
+    setThreadPrio(&tattrs[id], prio);
+    pthread_create(&tids[id], &tattrs[id], fn, &targs[id]);
+}
+
+void waitForThreads(int num)
+{
+    int i = 0;
+    int err = 0;
+
+    for(i = 0; i < num; i++) {
+        err = pthread_join(tids[i], NULL);
+        printf("avbtest: Thread t%d exit with result: %d \n", i, err);
+	playbackDone = 1;
+    }
+}
+
 int main(int argc, char* argv[])
 {
-	int i = 0;
-	int err = 0;
-	int numFrames = 0;
+    int i = 0;
+    int fd = 0;
+    int err = 0;
+    struct avbtestcfg cfg;
 
-	printf("AVB Test Application \n");
+    printf("AVB Test Application \n");
 
-	if(argc < 4) {
-		printf("Not enough params: Usage: avbtest -t|-r <number of frames> <filename> \n");
-		return -1;
-	}
+    if(parseargs(argc, argv, &cfg) < 0) {
+        printUsage();
+        return -1;
+    }
 
-	sscanf(&argv[2][0], "%d", &numFrames);
+    fd = open("/dev/ptp0", O_RDWR);
+    cfg.clkId = ((~(clockid_t) (fd) << 3) | 3);
 
-	if((argv[1][0] == '-') && (argv[1][1] == 't')) {
+    if((cfg.mode == AVB_TEST_MODE_AVB_PLAYBACK) || (cfg.mode == AVB_TEST_MODE_AVB_DEMO_TX)) {
+        printf("avbtest: Playing back %d frames from file %s \n", cfg.maxframes, cfg.filename);
+        initAndStartThread(T0, 50, &cfg, startPlayback, 0);
+        waitForThreads(1);
+    } else if(cfg.mode == AVB_TEST_MODE_AVB_RECORD) {
+        printf("avbtest: Recording %d frames to file %s \n", cfg.maxframes, cfg.filename);
+        initAndStartThread(T0, 50, &cfg, startRecord, 0);
+        waitForThreads(1);
+    } else if(cfg.mode == AVB_TEST_MODE_AVB_DEMO_RX) {
+        printf("avbtest: Demo mode b %d frames from file %s \n", cfg.maxframes, cfg.filename);
+        memcpy(&cfg.devname, "stereo2", strlen("stereo2")+1);
+        initAndStartThread(T0, 50, &cfg, startPlayback, 0);
+	cfg.timestamp = 1;
+        memcpy(&cfg.devname, "hw:CARD=avb,0", strlen("hw:CARD=avb,0")+1);
+        initAndStartThread(T1, 50, &cfg, startRecord, 1);
+	cfg.timestamp = 0;
+        memcpy(&cfg.devname, "stereo4", strlen("stereo4")+1);
+        initAndStartThread(T2, 50, &cfg, startPlayback, 1);
+	cfg.numchannels = 4; memcpy(&cfg.filename, "r042.wav", strlen("r042.wav")+1);
+        memcpy(&cfg.devname, "hw:CARD=C8CH,0", strlen("hw:CARD=C8CH,0")+1);
+        initAndStartThread(T3, 50, &cfg, startRecord, 0);
+        waitForThreads(4);
+    } else {
+        printUsage();
+        return -1;
+    }
 
-		printf("avbtest: Playing back %d frames from file %s \n", numFrames, &argv[3][0]);
+    printf("avbtest: Operation completed \n");
 
-		memset(&targs[AVB_TEST_AVB_PLAYBACK_THREAD], 0, sizeof(struct threadargs));
-		targs[AVB_TEST_AVB_PLAYBACK_THREAD].id = AVB_TEST_AVB_PLAYBACK_THREAD;
-		targs[AVB_TEST_AVB_PLAYBACK_THREAD].res = 0;
-		targs[AVB_TEST_AVB_PLAYBACK_THREAD].maxframes = numFrames;
-		memcpy(&targs[AVB_TEST_AVB_PLAYBACK_THREAD].filename[0], &argv[3][0], strlen(&argv[3][0]));
-		memcpy(&targs[AVB_TEST_AVB_PLAYBACK_THREAD].devname[0], "hw:CARD=avb,0", strlen("hw:CARD=avb,0"));
-		memcpy(&targs[AVB_TEST_AVB_PLAYBACK_THREAD].hwdepname[0], "hw:avb", strlen("hw:avb"));
-
-		pthread_create(&tids[AVB_TEST_AVB_PLAYBACK_THREAD], NULL, startPlayback, &targs[AVB_TEST_AVB_PLAYBACK_THREAD]);
-
-		memset(&targs[AVB_TEST_ANALOG_PLAYBACK_THREAD], 0, sizeof(struct threadargs));
-		targs[AVB_TEST_ANALOG_PLAYBACK_THREAD].id = AVB_TEST_ANALOG_PLAYBACK_THREAD;
-		targs[AVB_TEST_ANALOG_PLAYBACK_THREAD].res = 0;
-		targs[AVB_TEST_ANALOG_PLAYBACK_THREAD].maxframes = numFrames;
-		memcpy(&targs[AVB_TEST_ANALOG_PLAYBACK_THREAD].filename[0], &argv[3][0], strlen(&argv[3][0]));
-		memcpy(&targs[AVB_TEST_ANALOG_PLAYBACK_THREAD].devname[0], "hw:CARD=C8CH,0", strlen("hw:CARD=C8CH,0"));
-
-		pthread_create(&tids[AVB_TEST_ANALOG_PLAYBACK_THREAD], NULL, startPlayback, &targs[AVB_TEST_ANALOG_PLAYBACK_THREAD]);
-
-		for(i = 0; i < AVB_TEST_MAX_NUMBER_THREADS; i++) {
-			err = pthread_join(tids[i], NULL);
-			printf("avbtest: Thread t%d exit with result: %d \n", i, err);
-		}
-
-		printf("avbtest: Playback completed \n");
-
-	} else if((argv[1][0] == '-') && (argv[1][1] == 'r')) {
-		printf("avbtest: Recorrding %d frames to file %s \n", numFrames, &argv[3][0]);
-		return startRecord(numFrames, &argv[3][0]);
-	} else {
-		printf("Wrong params: Usage: avbtest -t|-r filename \n");
-		return -1;
-	}
-
-	return 0;
+    return 0;
 }
 
 void* startPlayback(void* argument)
 {
-	int err;
-	FILE* fp;
-	int numFrames = 0;
-	int readBytes = 0;
-	int sentFrames = 0;
-	int readFrames = 0;
-	snd_pcm_t *handle;
-	struct wavhdr hdr;
-	snd_hwdep_t* hwdep;
-	snd_pcm_uframes_t ringbufsize;
- 	snd_pcm_uframes_t periodsize;
-	struct timespec t1, t2, d;
-	struct threadargs* arg = (struct threadargs*)argument;
+    int err;
+    FILE* fp;
+    int ferr = 0;
+    int numFrames = 0;
+    int readBytes = 0;
+    int sentFrames = 0;
+    int readFrames = 0;
+    unsigned long ts = 0;
+    snd_pcm_t *handle;
+    struct wavhdr hdr;
+    snd_hwdep_t* hwdep;
+    snd_pcm_uframes_t ringbufsize;
+    snd_pcm_uframes_t periodsize;
+    struct timespec t, t1, t2, d;
+    struct threadargs* arg = (struct threadargs*)argument;
 
-	fp = fopen(arg->filename, "rb");
+    if(arg->cfg.tobuf == 0){
+        fp = fopen(arg->cfg.filename, "rb");
 
-	if(fp == NULL) {
-		printf("t%d: File open error", arg->id);
+        if(fp == NULL) {
+            printf("t%d: File (%s) open error \n", arg->id, arg->cfg.filename);
                 arg->res = -1;
                 return &arg->res;
-	}
-
-	fread((void*)&hdr, sizeof(struct wavhdr), 1, fp);
-
-	printf("t%d: size: %lu, chunksize: %d, fmtsize: %d datasize:%d \n", arg->id, sizeof(struct wavhdr), hdr.chunksize, hdr.fmtsize, hdr.datasize);
-	printf("t%d: chunkid: %c%c%c%c - ", arg->id, hdr.chunkid[0], hdr.chunkid[1], hdr.chunkid[2], hdr.chunkid[3]);
-	printf("format: %c%c%c%c - ", hdr.format[0], hdr.format[1], hdr.format[2], hdr.format[3]);
-	printf("fmtid: %c%c%c%c - ", hdr.fmtid[0], hdr.fmtid[1], hdr.fmtid[2], hdr.fmtid[3]);
-	printf("dataid: %c%c%c%c \n", hdr.dataid[0], hdr.dataid[1], hdr.dataid[2], hdr.dataid[3]);
-	printf("t%d: audioformat: %d, numchannels: %d, samplerate: %d\n", arg->id, hdr.audioformat, hdr.numchannels, hdr.samplerate);
-	printf("t%d: byterate: %d, blockalign: %d, bps: %d\n", arg->id, hdr.byterate, hdr.blockalign, hdr.bps);
-
-	if((hdr.chunkid[0] != 'R') || (hdr.chunkid[1] != 'I') || (hdr.chunkid[2] != 'F') || (hdr.chunkid[3] != 'F') ||
-	   (hdr.format[0]  != 'W') || (hdr.format[1]  != 'A') || (hdr.format[2]  != 'V') || (hdr.format[3]  != 'E') ||
-	   (hdr.fmtid[0]   != 'f') || (hdr.fmtid[1]   != 'm') || (hdr.fmtid[2]   != 't') || (hdr.fmtid[3]   != ' ') ||
-	   (hdr.dataid[0]  != 'd') || (hdr.dataid[1]  != 'a') || (hdr.dataid[2]  != 't') || (hdr.dataid[3]  != 'a') ||
-	   (hdr.fmtsize != 16) || (hdr.audioformat != 1) || (hdr.bps != 16)) {
-		printf("t%d: Wave header error \n", arg->id);
-		arg->res = -1;
-                return &arg->res;
-	}
-
-	if(arg->hwdepname[0] != 0) {
-		if ((err = snd_hwdep_open(&hwdep, &arg->hwdepname[0], SND_HWDEP_OPEN_DUPLEX)) < 0) {
-			printf("t%d: Playback hwdep open error: %s\n", arg->id, snd_strerror(err));
-			arg->res = -1;
-		        return &arg->res;	
-		} 
-	}
-
-	if ((err = snd_pcm_open(&handle, &arg->devname[0], SND_PCM_STREAM_PLAYBACK, 0)) < 0) {
-		printf("t%d: Playback open error: %s\n", arg->id, snd_strerror(err));
-		arg->res = -1;
-                return &arg->res;
         }
 
-	if ((err = snd_pcm_set_params(handle, SND_PCM_FORMAT_S16_LE, SND_PCM_ACCESS_RW_INTERLEAVED, hdr.numchannels, hdr.samplerate, 1, 100000)) < 0) {
-		printf("t%d: Playback set params error: %s\n", arg->id, snd_strerror(err));
-		arg->res = -1;
-                return &arg->res;
+        fread((void*)&hdr, sizeof(struct wavhdr), 1, fp);
+
+        printf("t%d: size: %lu, chunksize: %d, fmtsize: %d datasize:%d \n", arg->id, sizeof(struct wavhdr), hdr.chunksize, hdr.fmtsize, hdr.datasize);
+        printf("t%d: chunkid: %c%c%c%c - ", arg->id, hdr.chunkid[0], hdr.chunkid[1], hdr.chunkid[2], hdr.chunkid[3]);
+        printf("format: %c%c%c%c - ", hdr.format[0], hdr.format[1], hdr.format[2], hdr.format[3]);
+        printf("fmtid: %c%c%c%c - ", hdr.fmtid[0], hdr.fmtid[1], hdr.fmtid[2], hdr.fmtid[3]);
+        printf("dataid: %c%c%c%c \n", hdr.dataid[0], hdr.dataid[1], hdr.dataid[2], hdr.dataid[3]);
+        printf("t%d: audioformat: %d, numchannels: %d, samplerate: %d\n", arg->id, hdr.audioformat, hdr.numchannels, hdr.samplerate);
+        printf("t%d: byterate: %d, blockalign: %d, bps: %d\n", arg->id, hdr.byterate, hdr.blockalign, hdr.bps);
+
+        if((hdr.chunkid[0] != 'R') || (hdr.chunkid[1] != 'I') || (hdr.chunkid[2] != 'F') || (hdr.chunkid[3] != 'F') ||
+           (hdr.format[0]  != 'W') || (hdr.format[1]  != 'A') || (hdr.format[2]  != 'V') || (hdr.format[3]  != 'E') ||
+           (hdr.fmtid[0]   != 'f') || (hdr.fmtid[1]   != 'm') || (hdr.fmtid[2]   != 't') || (hdr.fmtid[3]   != ' ') ||
+           (hdr.dataid[0]  != 'd') || (hdr.dataid[1]  != 'a') || (hdr.dataid[2]  != 't') || (hdr.dataid[3]  != 'a') ||
+           (hdr.fmtsize != 16) || (hdr.audioformat != 1) || (hdr.bps != 16)) {
+              printf("t%d: Wave header error \n", arg->id);
+              arg->res = -1;
+              return &arg->res;
+        }
+    } else {
+        hdr.chunkid[0] = 'R'; hdr.chunkid[1] = 'I'; hdr.chunkid[2] = 'F'; hdr.chunkid[3] = 'F';
+        hdr.format[0] = 'W'; hdr.format[1] = 'A'; hdr.format[2] = 'V'; hdr.format[3] = 'E';
+        hdr.fmtid[0] = 'f'; hdr.fmtid[1] = 'm'; hdr.fmtid[2] = 't'; hdr.fmtid[3] = ' ';
+        hdr.dataid[0] = 'd'; hdr.dataid[1] = 'a'; hdr.dataid[2] = 't'; hdr.dataid[3] = 'a';
+        hdr.audioformat = 1; hdr.bps = 16; hdr.numchannels = 2; 
+        hdr.blockalign = 4; hdr.samplerate = 48000; hdr.byterate = ((hdr.numchannels * (hdr.bps / 8)) * hdr.samplerate);
+    }
+
+    if((arg->cfg.hwdepname[0] != 0) && (arg->cfg.timestamp != 0)) {
+        if((err = snd_hwdep_open(&hwdep, &arg->cfg.hwdepname[0], SND_HWDEP_OPEN_DUPLEX)) < 0) {
+            printf("t%d: Playback hwdep open error: %s\n", arg->id, snd_strerror(err));
+            arg->res = -1;
+            return &arg->res;
+        }
+    }
+
+    if((err = snd_pcm_open(&handle, &arg->cfg.devname[0], SND_PCM_STREAM_PLAYBACK, 0)) < 0) {
+      printf("t%d: Playback open error: %s\n", arg->id, snd_strerror(err));
+      arg->res = -1;
+      return &arg->res;
+    }
+
+    if((err = snd_pcm_set_params(handle, SND_PCM_FORMAT_S16_LE, SND_PCM_ACCESS_RW_INTERLEAVED, hdr.numchannels, hdr.samplerate, 0, 125000)) < 0) {
+      printf("t%d: Playback set params error: %s\n", arg->id, snd_strerror(err));
+      arg->res = -1;
+      return &arg->res;
+    }
+
+    snd_pcm_get_params(handle, &ringbufsize, &periodsize);
+    printf("t%d: Playback params ringbufsize: %li, periodsize: %li\n", arg->id, ringbufsize, periodsize);
+
+    if((arg->cfg.sync != 0) && (arg->cfg.timestamp == 0)) {
+      clock_gettime(arg->cfg.clkId, &t1);
+      if(arg->cfg.tobuf == 0) {
+        do {
+          usleep(1000);
+          clock_gettime(arg->cfg.clkId, &t);
+        } while(((t.tv_sec % 3) != 0) || (t.tv_sec == t1.tv_sec));
+      } else {
+	do {
+          usleep(1000);
+          clock_gettime(arg->cfg.clkId, &t);
+        } while((syncts == 0) || (t.tv_sec < synctime.tv_sec) || (t.tv_nsec < synctime.tv_nsec));
+      }
+    }
+
+    clock_gettime(arg->cfg.clkId, &t1);
+
+    if(arg->cfg.timestamp != 0) {
+       t2.tv_sec = (((t1.tv_sec / 3) + 1) * 3);
+       t2.tv_nsec = 0;
+       timespec_diff(&t1, &t2, &d);
+       printf("t%d: Timestamp diff @ %d s %d ns \n", arg->id, d.tv_sec, d.tv_nsec);
+    }
+
+    printf("t%d: Playback starting @ %d s %d ns \n", arg->id, t1.tv_sec, t1.tv_nsec);
+
+    while(((numFrames < arg->cfg.maxframes) || (arg->cfg.maxframes == -1)) && (ferr == 0) && (playbackDone == 0)) {
+        readFrames = (((arg->cfg.maxframes - numFrames) > AVB_TEST_NUM_FRAMES_IN_BUFFER)?(AVB_TEST_NUM_FRAMES_IN_BUFFER):(arg->cfg.maxframes - numFrames));
+        readFrames = ((readFrames < 0)?(AVB_TEST_NUM_FRAMES_IN_BUFFER):(readFrames));
+        readFrames = ((readFrames < periodsize)?(readFrames):(periodsize));
+        readBytes  = readFrames * hdr.numchannels * (hdr.bps / 8);
+
+        if(arg->cfg.tobuf == 0)
+            fread((void*)&buf[arg->id][0], readBytes, 1, fp);
+        else {
+            while((audbufsize < readBytes) && (playbackDone == 0)) usleep(1000);
+            memcpy(&buf[arg->id][0], &audbuf[currTxIdx], readBytes);
+            currTxIdx += readBytes; currTxIdx %= AVB_TEST_AUD_BUFFER_SIZE;
+            audbufsize -= readBytes;
         }
 
-	snd_pcm_get_params(handle, &ringbufsize, &periodsize);
-	printf("t%d: Playback params ringbufsize: %li, periodsize: %li\n", arg->id, ringbufsize, periodsize);
-
-	clock_gettime(CLOCK_REALTIME, &t1);
-
-	while(((numFrames < arg->maxframes) || (arg->maxframes == -1)) && (ferror(fp) == 0) && (feof(fp) == 0)) {
-		readFrames = (((arg->maxframes - numFrames) > AVB_TEST_NUM_FRAMES_IN_BUFFER)?(AVB_TEST_NUM_FRAMES_IN_BUFFER):(arg->maxframes - numFrames));
-		readFrames = ((readFrames < 0)?(AVB_TEST_NUM_FRAMES_IN_BUFFER):(readFrames));
-		readFrames = ((readFrames < periodsize)?(readFrames):(periodsize));
-		readBytes  = readFrames * hdr.numchannels * (hdr.bps / 8);
-
-		fread((void*)&buf[0], readBytes, 1, fp);
-
-		if(arg->hwdepname[0] != 0)
-			snd_hwdep_ioctl(hwdep, 0, (void*)t1.tv_nsec);
-
-		sentFrames = snd_pcm_writei(handle, &buf[0], readFrames);
-
-		if (sentFrames < 0)
-			sentFrames = snd_pcm_recover(handle, sentFrames, 0);
-		if (sentFrames < 0) {
-			printf("t%d: snd_pcm_writei failed: %s (%d)\n", arg->id, snd_strerror(sentFrames), sentFrames);
-			break;
-		}
-
-		if ((sentFrames > 0) && (sentFrames < readFrames))
-			printf("t%d: Short write (expected %d, wrote %d)\n", arg->id, readFrames, sentFrames);
-
-		numFrames += sentFrames;
-
-		if((numFrames != 0) && ((numFrames % 100) == 0))
-			printf("t%d: Playback sent %d frames\n", arg->id, numFrames);
+        if((arg->cfg.hwdepname[0] != 0) && (arg->cfg.timestamp != 0)) {
+	    clock_gettime(arg->cfg.clkId, &t);
+            timespec_sum(&t, &d);
+	    ts = getAVTPTs(&t);
+	    printf("t%d: Sync for %lus %luns ts: %lu \n", arg->id, t.tv_sec, t.tv_nsec, ts);
+            snd_hwdep_ioctl(hwdep, 0, (void*)ts);
 	}
 
-	clock_gettime(CLOCK_REALTIME, &t2);
-	timespec_diff(&t1, &t2, &d);
+        sentFrames = snd_pcm_writei(handle, &buf[arg->id][0], readFrames);
 
-	printf("t%d: Playback sent %d frames in %lds, %dms\n", arg->id, numFrames, d.tv_sec, (int)((double)d.tv_nsec / 1.0e6));
+        if(sentFrames < 0)
+            sentFrames = snd_pcm_recover(handle, sentFrames, 0);
+        if(sentFrames < 0) {
+            printf("t%d: snd_pcm_writei failed: %s (%d)\n", arg->id, snd_strerror(sentFrames), sentFrames);
+            break;
+        }
 
-	fclose(fp);
-	snd_pcm_close(handle);
+        if((sentFrames > 0) && (sentFrames < readFrames))
+            printf("t%d: Short write (expected %d, wrote %d)\n", arg->id, readFrames, sentFrames);
 
-	return 0;
+        numFrames += sentFrames;
+
+	if(arg->cfg.tobuf == 0) 
+        	printf("t%d: Playback sent %d frames\n", arg->id, numFrames);
+	else
+		printf("t%d: Playback sent %d frames currTxIdx: %d audbufsize: %d\n",
+			arg->id, numFrames, (currTxIdx / (hdr.numchannels * (hdr.bps / 8))),
+			(audbufsize / (hdr.numchannels * (hdr.bps / 8))));
+
+	if(arg->cfg.tobuf == 0) 
+           if((ferror(fp) != 0) || (feof(fp) != 0))
+              ferr = 1;
+    }
+
+    clock_gettime(arg->cfg.clkId, &t2);
+    timespec_diff(&t1, &t2, &d);
+
+    printf("t%d: Playback sent %d frames in %lds, %dms\n", arg->id, numFrames, d.tv_sec, (int)((double)d.tv_nsec / 1.0e6));
+
+    if(arg->cfg.tobuf == 0) 
+      fclose(fp);
+
+    snd_pcm_close(handle);
+
+    return 0;
 }
 
-int startRecord(int maxFrames, char* filename)
+void* startRecord(void* argument)
 {
-	int err;
-	FILE* fp;
-	FILE* fi;
-	int numFrames = 0;
-	int readBytes = 0;
-	int rcvdFrames = 0;
-	int readFrames = 0;
-	snd_pcm_t *handle;
-	struct wavhdr hdr;
-	unsigned long ts;
-	snd_hwdep_t* hwdep;
-	snd_pcm_uframes_t ringbufsize;
- 	snd_pcm_uframes_t periodsize;
+    int err;
+    FILE* fp;
+    FILE* fi;
+    int numFrames = 0;
+    int readBytes = 0;
+    int rcvdFrames = 0;
+    int readFrames = 0;
+    snd_pcm_t *handle;
+    struct wavhdr hdr;
+    unsigned long ts = 0;
+    snd_hwdep_t* hwdep;
+    snd_pcm_uframes_t ringbufsize;
+     snd_pcm_uframes_t periodsize;
+    unsigned char tmpfile[AVB_TEST_MAX_FILE_NAME_SIZE] = {0};
+    struct threadargs* arg = (struct threadargs*)argument;
 
-	hdr.chunkid[0] = 'R'; hdr.chunkid[1] = 'I'; hdr.chunkid[2] = 'F'; hdr.chunkid[3] = 'F';
-	hdr.format[0] = 'W'; hdr.format[1] = 'A'; hdr.format[2] = 'V'; hdr.format[3] = 'E';
-	hdr.fmtid[0] = 'f'; hdr.fmtid[1] = 'm'; hdr.fmtid[2] = 't'; hdr.fmtid[3] = ' ';
-	hdr.dataid[0] = 'd'; hdr.dataid[1] = 'a'; hdr.dataid[2] = 't'; hdr.dataid[3] = 'a';
-	hdr.audioformat = 1; hdr.bps = 16; hdr.numchannels = 2; 
-	hdr.blockalign = 4; hdr.samplerate = 48000; hdr.byterate = ((hdr.numchannels * (hdr.bps / 8)) * hdr.samplerate);
+    hdr.chunkid[0] = 'R'; hdr.chunkid[1] = 'I'; hdr.chunkid[2] = 'F'; hdr.chunkid[3] = 'F';
+    hdr.format[0] = 'W'; hdr.format[1] = 'A'; hdr.format[2] = 'V'; hdr.format[3] = 'E';
+    hdr.fmtid[0] = 'f'; hdr.fmtid[1] = 'm'; hdr.fmtid[2] = 't'; hdr.fmtid[3] = ' ';
+    hdr.dataid[0] = 'd'; hdr.dataid[1] = 'a'; hdr.dataid[2] = 't'; hdr.dataid[3] = 'a';
+    hdr.audioformat = 1; hdr.bps = 16; hdr.numchannels = arg->cfg.numchannels; 
+    hdr.blockalign = 4; hdr.samplerate = 48000; hdr.byterate = ((hdr.numchannels * (hdr.bps / 8)) * hdr.samplerate);
 
-	fp = fopen("r.tmp", "wb");
+    if(arg->cfg.tobuf == 0) {
+        sprintf(&tmpfile[0], "r%d.tmp", arg->id);
+        fp = fopen(&tmpfile[0], "wb");
 
-	if(fp == NULL) {
-		printf("File open error");
-                return -1;
-	}
+        if(fp == NULL) {
+            printf("t%d: File (%s) open error \n", arg->id, arg->cfg.filename);
+            arg->res = -1;
+            return &arg->res;
+        }
+    }
 
-	if ((err = snd_hwdep_open(&hwdep, "hw:avb", SND_HWDEP_OPEN_DUPLEX)) < 0) {
-		printf("Playback hwdep open error: %s\n", snd_strerror(err));
-		return -1;	
-	} 
+    if((arg->cfg.hwdepname[0] != 0) && (arg->cfg.timestamp != 0)) {
+        if((err = snd_hwdep_open(&hwdep, arg->cfg.hwdepname, SND_HWDEP_OPEN_DUPLEX)) < 0) {
+            printf("t%d: Playback hwdep open error: %s\n", arg->id, snd_strerror(err));
+            arg->res = -1;
+            return &arg->res;
+        }
+    }
 
-	if ((err = snd_pcm_open(&handle, "hw:CARD=avb,0", SND_PCM_STREAM_CAPTURE, 0)) < 0) {
-		printf("Record open error: %s\n", snd_strerror(err));
-		return -1;
+    if((err = snd_pcm_open(&handle, arg->cfg.devname, SND_PCM_STREAM_CAPTURE, 0)) < 0) {
+        printf("t%d: Record open error: %s\n", arg->id, snd_strerror(err));
+        arg->res = -1;
+        return &arg->res;
+    }
+
+    if((err = snd_pcm_set_params(handle, SND_PCM_FORMAT_S16_LE, SND_PCM_ACCESS_RW_INTERLEAVED, hdr.numchannels, hdr.samplerate, 0, 125000)) < 0) {
+        printf("t%d: Record opset params error: %s\n", arg->id, snd_strerror(err));
+        arg->res = -1;
+        return &arg->res;
+    }
+
+    if((err = snd_pcm_prepare (handle)) < 0) {
+        printf ("t%d: Record cannot prepare audio interface for use (%s) %d\n", arg->id, snd_strerror(err), err);
+        arg->res = -1;
+        return &arg->res;
+    }
+
+    snd_pcm_get_params(handle, &ringbufsize, &periodsize);
+    printf("t%d: Record params ringbufsize: %li, periodsize: %li\n", arg->id, ringbufsize, periodsize);
+
+    snd_pcm_start(handle);
+
+    while(((numFrames < arg->cfg.maxframes) || (arg->cfg.maxframes == -1)) && (playbackDone == 0)) {
+        readFrames = (((arg->cfg.maxframes - numFrames) > AVB_TEST_NUM_FRAMES_IN_BUFFER)?(AVB_TEST_NUM_FRAMES_IN_BUFFER):(arg->cfg.maxframes - numFrames));
+        readFrames = ((readFrames < 0)?(AVB_TEST_NUM_FRAMES_IN_BUFFER):(readFrames));
+        readFrames = ((readFrames < periodsize)?(readFrames):(periodsize));
+        readBytes  = readFrames * hdr.numchannels * (hdr.bps / 8);
+
+        rcvdFrames = snd_pcm_readi(handle, &buf[arg->id][0], readFrames);
+
+        if(rcvdFrames < 0) {
+            rcvdFrames = snd_pcm_recover(handle, rcvdFrames, 0);
+            snd_pcm_start(handle);
+            continue;
+        }
+        if(rcvdFrames < 0) {
+            printf("t%d: snd_pcm_readi failed: %s (%d)\n", arg->id, snd_strerror(rcvdFrames), rcvdFrames);
+            break;
         }
 
-	if ((err = snd_pcm_set_params(handle, SND_PCM_FORMAT_S16_LE, SND_PCM_ACCESS_RW_INTERLEAVED, hdr.numchannels, hdr.samplerate, 0, 100000)) < 0) {
-		printf("Record opset params error: %s\n", snd_strerror(err));
-		return -1;
+        if((rcvdFrames > 0) && (rcvdFrames < readFrames)) {
+            printf("t%d: Short read (expected %d, read %d)\n", arg->id, readFrames, rcvdFrames);
+
+            if(arg->cfg.maxframes == -1)
+              break;
         }
 
-	if ((err = snd_pcm_prepare (handle)) < 0) {
-		printf ("Record cannot prepare audio interface for use (%s) %d\n", snd_strerror(err), err);
-		return -1;
-	}
+        if((arg->cfg.hwdepname[0] != 0) && (arg->cfg.timestamp != 0)) {
+	    if(syncts == 0) {
+	       snd_hwdep_ioctl(hwdep, 1, (void*)&ts);
+	       syncts = ts;
+	       clock_gettime(arg->cfg.clkId, &synctime);
+	       printf("t%d: Record read ts %lu (%lds, %dns)\n", arg->id, ts, synctime.tv_sec, synctime.tv_nsec);
+	       getAVTPSt(syncts, &synctime);
+	       printf("t%d: Record synctime (%lds, %dns)\n", arg->id, synctime.tv_sec, synctime.tv_nsec);
+	    }
+        }
 
-	snd_pcm_get_params(handle, &ringbufsize, &periodsize);
-	printf("Playback params ringbufsize: %li, periodsize: %li\n", ringbufsize, periodsize);
+        if(arg->cfg.tobuf == 0)
+            fwrite((void*)&buf[arg->id][0], 1, readBytes, fp);
+        else {
+            memcpy(&audbuf[currRxIdx], &buf[arg->id][0], readBytes);
+            audbufsize += readBytes; if(audbufsize > AVB_TEST_AUD_BUFFER_SIZE) assert(0);
+            currRxIdx += readBytes; currRxIdx %= AVB_TEST_AUD_BUFFER_SIZE;
+        }
 
-	snd_pcm_start(handle);
+        numFrames += rcvdFrames;
 
-	while(numFrames < maxFrames) {
-		readFrames = (((maxFrames - numFrames) > AVB_TEST_NUM_FRAMES_IN_BUFFER)?(AVB_TEST_NUM_FRAMES_IN_BUFFER):(maxFrames - numFrames));
-		readBytes  = readFrames * hdr.numchannels * (hdr.bps / 8);
+	if(arg->cfg.tobuf == 0)
+        	printf("t%d: Record received %d frames\n", arg->id, numFrames);
+	else
+		printf("t%d: Record received %d frames currRxIdx: %d, audbufsize: %d\n",
+			arg->id, numFrames, (currRxIdx / (hdr.numchannels * (hdr.bps / 8))),
+			(audbufsize / (hdr.numchannels * (hdr.bps / 8))));
+    }
 
-		printf("Record reading %d frames", readFrames);
+    snd_pcm_drop(handle);
 
-		rcvdFrames = snd_pcm_readi(handle, &buf[0], readFrames);
+    hdr.fmtsize = 16; hdr.datasize = ((hdr.numchannels * (hdr.bps / 8)) * numFrames); hdr.chunksize = 36 + hdr.datasize;
+    printf("t%d: Record received %d frames\n", arg->id, numFrames);
 
-		if (rcvdFrames < 0) {
-			rcvdFrames = snd_pcm_recover(handle, rcvdFrames, 0);
-			snd_pcm_start(handle);
-			continue;
-		}
-		if (rcvdFrames < 0) {
-			printf("snd_pcm_readi failed: %s (%d)\n", snd_strerror(rcvdFrames), rcvdFrames);
-			break;
-		}
+    snd_pcm_close(handle);
 
-		if ((rcvdFrames > 0) && (rcvdFrames < readFrames))
-			printf("Short read (expected %d, read %d)\n", readFrames, rcvdFrames);
+    if(arg->cfg.tobuf == 0) {
+        fflush(fp);
+        fclose(fp);
+    }
 
-		snd_hwdep_ioctl(hwdep, 1, (void*)&ts);
-		printf(" - Record read ts %ld \n", ts);
+    if(arg->cfg.tobuf == 0) {
+        fi = fopen(&tmpfile[0], "rb");
+        fp = fopen(arg->cfg.filename, "wb");
 
-		fwrite((void*)&buf[0], 1, readBytes, fp);
+        if((fp == NULL) || (fi == NULL)) {
+            printf("t%d: File open error", arg->id);
+                arg->res = -1;
+                return &arg->res;
+        }
 
-		numFrames += rcvdFrames;
-	}
+        fwrite((void*)&hdr, sizeof(struct wavhdr), 1, fp);
 
-	snd_pcm_drop(handle);
+        while((ferror(fi) == 0) && (feof(fi) == 0)) {
+            readBytes = fread((void*)&buf[arg->id][0], 1, AVB_TEST_NUM_BYTES_IN_BUFFER, fi);
+            fwrite((void*)&buf[arg->id][0], 1, readBytes, fp);
+        }
 
-	hdr.fmtsize = 16; hdr.datasize = ((hdr.numchannels * (hdr.bps / 8)) * numFrames); hdr.chunksize = 36 + hdr.datasize;
-	printf("Record received %d frames\n", numFrames);
+        fclose(fi);
+        fclose(fp);
+    }
 
-	snd_pcm_close(handle);
-	fflush(fp);
-	fclose(fp);
-
-	fi = fopen("r.tmp", "rb");
-	fp = fopen(filename, "wb");
-
-	if((fp == NULL) || (fi == NULL)) {
-		printf("File open error");
-                return -1;
-	}
-
-	fwrite((void*)&hdr, sizeof(struct wavhdr), 1, fp);
-
-	while((ferror(fi) == 0) && (feof(fi) == 0)) {
-		readBytes = fread((void*)&buf[0], 1, AVB_TEST_NUM_BYTES_IN_BUFFER, fi);
-		fwrite((void*)&buf[0], 1, readBytes, fp);
-	}
-
-	fclose(fi);
-	fclose(fp);
-
-	return 0;
+    return 0;
 }
+

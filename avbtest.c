@@ -105,7 +105,7 @@ void timespec_diff(struct timespec *start, struct timespec *stop, struct timespe
 
 void timespec_sum(struct timespec *a, struct timespec *b)
 {
-    if((a->tv_nsec + b->tv_nsec) > 1000000000) {
+    if((a->tv_nsec + b->tv_nsec) >= 1000000000) {
         a->tv_sec = a->tv_sec + b->tv_sec + 1;
         a->tv_nsec = (a->tv_nsec + b->tv_nsec) - 1000000000;
     } else {
@@ -147,6 +147,7 @@ void setThreadPrio(pthread_attr_t* ptattrs, int prio)
     pthread_attr_init(ptattrs);
     pthread_attr_getschedparam(ptattrs, &param);
     param.sched_priority = prio;
+    pthread_attr_setschedpolicy(ptattrs, SCHED_FIFO);
     pthread_attr_setschedparam(ptattrs, &param);
 }
 
@@ -263,7 +264,7 @@ int main(int argc, char* argv[])
         initAndStartThread(T0, 50, &cfg, startPlayback, 0);
 	cfg.timestamp = 1;
         memcpy(&cfg.devname, "hw:CARD=avb,0", strlen("hw:CARD=avb,0")+1);
-        initAndStartThread(T1, 50, &cfg, startRecord, 1);
+        initAndStartThread(T1, 99, &cfg, startRecord, 1);
 	cfg.timestamp = 0;
         memcpy(&cfg.devname, "stereo4", strlen("stereo4")+1);
         initAndStartThread(T2, 50, &cfg, startPlayback, 1);
@@ -290,7 +291,9 @@ void* startPlayback(void* argument)
     int readBytes = 0;
     int sentFrames = 0;
     int readFrames = 0;
+    int latency = 125000;
     unsigned long ts = 0;
+    unsigned char diffcalc = 0;
     snd_pcm_t *handle;
     struct wavhdr hdr;
     snd_hwdep_t* hwdep;
@@ -350,7 +353,8 @@ void* startPlayback(void* argument)
       return &arg->res;
     }
 
-    if((err = snd_pcm_set_params(handle, SND_PCM_FORMAT_S16_LE, SND_PCM_ACCESS_RW_INTERLEAVED, hdr.numchannels, hdr.samplerate, 0, 125000)) < 0) {
+    latency = ((arg->cfg.timestamp != 0)?(250000):(125000));
+    if((err = snd_pcm_set_params(handle, SND_PCM_FORMAT_S16_LE, SND_PCM_ACCESS_RW_INTERLEAVED, hdr.numchannels, hdr.samplerate, 0, latency)) < 0) {
       printf("t%d: Playback set params error: %s\n", arg->id, snd_strerror(err));
       arg->res = -1;
       return &arg->res;
@@ -363,12 +367,12 @@ void* startPlayback(void* argument)
       clock_gettime(arg->cfg.clkId, &t1);
       if(arg->cfg.tobuf == 0) {
         do {
-          usleep(1000);
+          usleep(100);
           clock_gettime(arg->cfg.clkId, &t);
         } while(((t.tv_sec % 3) != 0) || (t.tv_sec == t1.tv_sec));
       } else {
 	do {
-          usleep(1000);
+          usleep(100);
           clock_gettime(arg->cfg.clkId, &t);
         } while((syncts == 0) || (t.tv_sec < synctime.tv_sec) || (t.tv_nsec < synctime.tv_nsec));
       }
@@ -376,14 +380,9 @@ void* startPlayback(void* argument)
 
     clock_gettime(arg->cfg.clkId, &t1);
 
-    if(arg->cfg.timestamp != 0) {
-       t2.tv_sec = (((t1.tv_sec / 3) + 1) * 3);
-       t2.tv_nsec = 0;
-       timespec_diff(&t1, &t2, &d);
-       printf("t%d: Timestamp diff @ %d s %d ns \n", arg->id, d.tv_sec, d.tv_nsec);
-    }
-
     printf("t%d: Playback starting @ %d s %d ns \n", arg->id, t1.tv_sec, t1.tv_nsec);
+
+    usleep(1);
 
     while(((numFrames < arg->cfg.maxframes) || (arg->cfg.maxframes == -1)) && (ferr == 0) && (playbackDone == 0)) {
         readFrames = (((arg->cfg.maxframes - numFrames) > AVB_TEST_NUM_FRAMES_IN_BUFFER)?(AVB_TEST_NUM_FRAMES_IN_BUFFER):(arg->cfg.maxframes - numFrames));
@@ -394,7 +393,7 @@ void* startPlayback(void* argument)
         if(arg->cfg.tobuf == 0)
             fread((void*)&buf[arg->id][0], readBytes, 1, fp);
         else {
-            while((audbufsize < readBytes) && (playbackDone == 0)) usleep(1000);
+            while((audbufsize < (2 * readBytes)) && (playbackDone == 0)) usleep(1000);
             memcpy(&buf[arg->id][0], &audbuf[currTxIdx], readBytes);
             currTxIdx += readBytes; currTxIdx %= AVB_TEST_AUD_BUFFER_SIZE;
             audbufsize -= readBytes;
@@ -402,6 +401,13 @@ void* startPlayback(void* argument)
 
         if((arg->cfg.hwdepname[0] != 0) && (arg->cfg.timestamp != 0)) {
 	    clock_gettime(arg->cfg.clkId, &t);
+	    if(diffcalc == 0) {
+	       diffcalc = 1;
+	       t2.tv_sec = (((t.tv_sec / 3) + 1) * 3);
+               t2.tv_nsec = 0;
+               timespec_diff(&t, &t2, &d);
+               printf("t%d: Timestamp diff @ %d s %d ns \n", arg->id, d.tv_sec, d.tv_nsec);
+	    }
             timespec_sum(&t, &d);
 	    ts = getAVTPTs(&t);
 	    printf("t%d: Sync for %lus %luns ts: %lu \n", arg->id, t.tv_sec, t.tv_nsec, ts);

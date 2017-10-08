@@ -16,6 +16,7 @@
 #define AVB_TEST_DBG_LVL_ERROR           0
 #define AVB_TEST_DBG_LVL_WARNING         1
 #define AVB_TEST_DBG_LVL_INFO            2
+
 #define AVB_TEST_DBG_LVL_VERBOSE         3
 
 #define AVB_TEST_MODE_AVB_PLAYBACK       0
@@ -23,15 +24,17 @@
 #define AVB_TEST_MODE_AVB_DEMO_TX        2
 #define AVB_TEST_MODE_AVB_DEMO_RX_1      3
 #define AVB_TEST_MODE_AVB_DEMO_RX_2      4
+#define AVB_TEST_MODE_AVB_DEMO_DEV_X     5
+#define AVB_TEST_MODE_AVB_DEMO_DEV_Y     6
 
 #define AVB_TEST_MAX_FILE_NAME_SIZE    1024
 #define AVB_TEST_MAX_DEV_NAME_SIZE     256
 #define AVB_TEST_MAX_HWDEP_NAME_SIZE   256
 #define AVB_TEST_NUM_FRAMES_IN_BUFFER  8192
-#define AVB_TEST_NUM_BYTES_IN_BUFFER  (AVB_TEST_NUM_FRAMES_IN_BUFFER * 2 * 2) /* 2 channels, 2 bytes per sample */
+#define AVB_TEST_NUM_BYTES_IN_BUFFER  (AVB_TEST_NUM_FRAMES_IN_BUFFER * 8 * 2) /* Max 8 channels, 2 bytes per sample */
 
-#define AVB_TEST_AUD_BUFFER_NUM_FRAMES  (4 * 48000) /* for 4 seconds @ 48000 HZ */
-#define AVB_TEST_AUD_BUFFER_SIZE        (AVB_TEST_AUD_BUFFER_NUM_FRAMES * 2 * 2) /* 2 channels, 2 bytes per sample */
+#define AVB_TEST_AUD_BUFFER_NUM_FRAMES  (10 * 192000) /* for Max 10 seconds @ 192000 HZ */
+#define AVB_TEST_AUD_BUFFER_SIZE        (AVB_TEST_AUD_BUFFER_NUM_FRAMES * 8 * 2) /* Max 8 channels, 2 bytes per sample */
 
 #pragma pack(push, 1)
 
@@ -58,6 +61,7 @@ struct avbtestcfg {
     int clkId;
     int dbgLvl;
     int maxframes;
+    int samplerate;
     int numchannels;
     unsigned char sync;
     unsigned char tobuf;
@@ -160,17 +164,19 @@ void setThreadPrio(pthread_attr_t* ptattrs, int prio)
 }
 
 void printUsage(void) {
-    printf("Usage: avbtest {-p|-r|-a|-b|-c} <filename> -n <number of frames> -d <devicename> -l <dbglevel> -t -s \n");
+    printf("Usage: avbtest {-p|-r|-a|-b[0|1]|x|y} <filename> -d <devicename> -n <number of frames> -c <number of channels> -r <sampling rate> -l <dbglevel>\n");
 }
 
 int parseargs(int argc, char* argv[], struct avbtestcfg* cfg)
 {
-    int i;
+    int i = 0;
+    int idx = 0;
 
     memset(cfg, 0, sizeof(struct avbtestcfg));
 
     cfg->maxframes = -1;
     cfg->numchannels = 2;
+    cfg->samplerate = 48000;
     cfg->mode = AVB_TEST_MODE_AVB_PLAYBACK;
     memcpy(&cfg->hwdepname[0], "hw:avb", strlen("hw:avb"));
 
@@ -179,43 +185,53 @@ int parseargs(int argc, char* argv[], struct avbtestcfg* cfg)
             switch(argv[i][1]) {
                 case 'p':
                     cfg->mode = AVB_TEST_MODE_AVB_PLAYBACK;
-                    sscanf(&argv[(++i)][0], "%s", cfg->filename);
                     break;
                 case 'r':
                     cfg->mode = AVB_TEST_MODE_AVB_RECORD;
-                    sscanf(&argv[(++i)][0], "%s", cfg->filename);
+                    break;
+		case 'x':
+                    cfg->mode = AVB_TEST_MODE_AVB_DEMO_DEV_X;
+		    cfg->timestamp = 1;
+		    cfg->sync = 1;
+                    break;
+		case 'y':
+                    cfg->mode = AVB_TEST_MODE_AVB_DEMO_DEV_Y;
+		    cfg->sync = 1;
                     break;
                 case 'a':
                     cfg->mode = AVB_TEST_MODE_AVB_DEMO_TX;
-                    sscanf(&argv[(++i)][0], "%s", cfg->filename);
+		    cfg->timestamp = 1;
                     break;
                 case 'b':
-                    cfg->mode = AVB_TEST_MODE_AVB_DEMO_RX_1;
-                    sscanf(&argv[(++i)][0], "%s", cfg->filename);
+		    sscanf(&argv[i][2], "%d", &idx);
+		    if(idx == 0) {
+                    	cfg->mode = AVB_TEST_MODE_AVB_DEMO_RX_1;
+		    } else {
+                    	cfg->mode = AVB_TEST_MODE_AVB_DEMO_RX_2;
+		    }
+		    cfg->sync = 1;
                     break;
                 case 'c':
-                    cfg->mode = AVB_TEST_MODE_AVB_DEMO_RX_2;
-                    sscanf(&argv[(++i)][0], "%s", cfg->filename);
+                    sscanf(&argv[i][2], "%d", &cfg->numchannels);
+                    break;
+		case 's':
+                    sscanf(&argv[i][2], "%d", &cfg->samplerate);
                     break;
                 case 'n':
-                    sscanf(&argv[++i][0], "%d", &cfg->maxframes);
+                    sscanf(&argv[i][2], "%d", &cfg->maxframes);
                     break;
                 case 'd':
-                    sscanf(&argv[++i][0], "%s", cfg->devname);
+                    sscanf(&argv[i][2], "%s", cfg->devname);
                     break;
 		case 'l':
-		    sscanf(&argv[++i][0], "%d", &cfg->dbgLvl);
+		    sscanf(&argv[i][2], "%d", &cfg->dbgLvl);
 		    break;
-                case 't':
-                    cfg->timestamp = 1;
-                    break;
-                case 's':
-                    cfg->sync = 1; /* Sync to the next exact second (no fractional seconds) that is a multiple of 3 */
-                    break;
                 default:
                     break;
             }
-        }
+        } else {
+		sscanf(&argv[i][0], "%s", cfg->filename);	
+	}
     }
 
     if(cfg->devname[0] == 0) {
@@ -266,15 +282,36 @@ int main(int argc, char* argv[])
     cfg.clkId = ((~(clockid_t) (fd) << 3) | 3);
 
     if((cfg.mode == AVB_TEST_MODE_AVB_PLAYBACK) || (cfg.mode == AVB_TEST_MODE_AVB_DEMO_TX)) {
-	printf("avbtest: Playing back %d frames from file %s \n", cfg.maxframes, cfg.filename);
+	printf("avbtest: Playing back %d frames from file %s (ch: %d sr: %d) \n", cfg.maxframes, cfg.filename, cfg.numchannels, cfg.samplerate);
         initAndStartThread(T0, 50, &cfg, startPlayback, 0);
         waitForThreads(1);
     } else if(cfg.mode == AVB_TEST_MODE_AVB_RECORD) {
-        printf("avbtest: Recording %d frames to file %s \n", cfg.maxframes, cfg.filename);
+        printf("avbtest: Recording %d frames to file %s (ch: %d sr: %d) \n", cfg.maxframes, cfg.filename, cfg.numchannels, cfg.samplerate);
         initAndStartThread(T0, 50, &cfg, startRecord, 0);
         waitForThreads(1);
+    } else if(cfg.mode == AVB_TEST_MODE_AVB_DEMO_DEV_X) {
+	printf("avbtest: Playing back %d frames from file %s (ch: %d sr: %d) \n", cfg.maxframes, cfg.filename, cfg.numchannels, cfg.samplerate);
+	cfg.sync = 1;
+	cfg.timestamp = 0;
+	memcpy(&cfg.devname, "hw:CARD=BeagleBoardX15,0", strlen("hw:CARD=BeagleBoardX15,0")+1);
+        initAndStartThread(T0, 50, &cfg, startPlayback, 0);
+	cfg.sync = 0;
+	cfg.timestamp = 1;
+        memcpy(&cfg.devname, "hw:CARD=avb,0", strlen("hw:CARD=avb,0")+1);
+	initAndStartThread(T1, 50, &cfg, startPlayback, 0);
+        waitForThreads(2);
+    } else if(cfg.mode == AVB_TEST_MODE_AVB_DEMO_DEV_Y) {
+	printf("avbtest: Playing back %d frames from file %s (ch: %d sr: %d) \n", cfg.maxframes, cfg.filename, cfg.numchannels, cfg.samplerate);
+	cfg.timestamp = 1;
+        memcpy(&cfg.devname, "hw:CARD=avb,0", strlen("hw:CARD=avb,0")+1);
+        initAndStartThread(T0, 99, &cfg, startRecord, 1);
+	cfg.sync = 1;
+	cfg.timestamp = 0;
+        memcpy(&cfg.devname, "stereo4", strlen("stereo4")+1);
+	initAndStartThread(T1, 50, &cfg, startPlayback, 1);
+        waitForThreads(2);
     } else if(cfg.mode == AVB_TEST_MODE_AVB_DEMO_RX_2) {
-        printf("avbtest: Demo mode b %d frames from file %s \n", cfg.maxframes, cfg.filename);
+        printf("avbtest: Demo mode b %d frames from file %s (ch: %d sr: %d) \n", cfg.maxframes, cfg.filename, cfg.numchannels, cfg.samplerate);
         memcpy(&cfg.devname, "stereo2", strlen("stereo2")+1);
         initAndStartThread(T0, 50, &cfg, startPlayback, 0);
 	cfg.timestamp = 1;
@@ -285,7 +322,7 @@ int main(int argc, char* argv[])
         initAndStartThread(T2, 50, &cfg, startPlayback, 1);
         waitForThreads(3);
     }  else if(cfg.mode == AVB_TEST_MODE_AVB_DEMO_RX_1) {
-        printf("avbtest: Demo mode b %d frames from file %s \n", cfg.maxframes, cfg.filename);
+        printf("avbtest: Demo mode b %d frames from file %s (ch: %d sr: %d) \n", cfg.maxframes, cfg.filename, cfg.numchannels, cfg.samplerate);
         memcpy(&cfg.devname, "stereo2", strlen("stereo2")+1);
         initAndStartThread(T0, 50, &cfg, startPlayback, 0);
 	cfg.timestamp = 1;
@@ -364,8 +401,8 @@ void* startPlayback(void* argument)
         hdr.format[0] = 'W'; hdr.format[1] = 'A'; hdr.format[2] = 'V'; hdr.format[3] = 'E';
         hdr.fmtid[0] = 'f'; hdr.fmtid[1] = 'm'; hdr.fmtid[2] = 't'; hdr.fmtid[3] = ' ';
         hdr.dataid[0] = 'd'; hdr.dataid[1] = 'a'; hdr.dataid[2] = 't'; hdr.dataid[3] = 'a';
-        hdr.audioformat = 1; hdr.bps = 16; hdr.numchannels = 2; 
-        hdr.blockalign = 4; hdr.samplerate = 48000; hdr.byterate = ((hdr.numchannels * (hdr.bps / 8)) * hdr.samplerate);
+        hdr.audioformat = 1; hdr.bps = 16; hdr.numchannels = arg->cfg.numchannels; 
+        hdr.blockalign = (hdr.numchannels * (hdr.bps / 8)); hdr.samplerate = arg->cfg.samplerate; hdr.byterate = ((hdr.numchannels * (hdr.bps / 8)) * hdr.samplerate);
     }
 
     if((arg->cfg.hwdepname[0] != 0) && (arg->cfg.timestamp != 0)) {
@@ -517,7 +554,7 @@ void* startRecord(void* argument)
     hdr.fmtid[0] = 'f'; hdr.fmtid[1] = 'm'; hdr.fmtid[2] = 't'; hdr.fmtid[3] = ' ';
     hdr.dataid[0] = 'd'; hdr.dataid[1] = 'a'; hdr.dataid[2] = 't'; hdr.dataid[3] = 'a';
     hdr.audioformat = 1; hdr.bps = 16; hdr.numchannels = arg->cfg.numchannels; 
-    hdr.blockalign = 4; hdr.samplerate = 48000; hdr.byterate = ((hdr.numchannels * (hdr.bps / 8)) * hdr.samplerate);
+    hdr.blockalign = (hdr.numchannels * (hdr.bps / 8)); hdr.samplerate = arg->cfg.samplerate; hdr.byterate = ((hdr.numchannels * (hdr.bps / 8)) * hdr.samplerate);
 
     if(arg->cfg.tobuf == 0) {
         sprintf(&tmpfile[0], "r%d.tmp", arg->id);
@@ -547,7 +584,7 @@ void* startRecord(void* argument)
         return &arg->res;
     }
 
-    if((err = snd_pcm_set_params(handle, SND_PCM_FORMAT_S16_LE, SND_PCM_ACCESS_RW_INTERLEAVED, hdr.numchannels, hdr.samplerate, 0, 125000)) < 0) {
+    if((err = snd_pcm_set_params(handle, SND_PCM_FORMAT_S16_LE, SND_PCM_ACCESS_RW_INTERLEAVED, hdr.numchannels, hdr.samplerate, 0, 250000)) < 0) {
         if(arg->cfg.dbgLvl >= AVB_TEST_DBG_LVL_ERROR)
 	   printf("t%d: Record opset params error: %s\n", arg->id, snd_strerror(err));
         arg->res = -1;

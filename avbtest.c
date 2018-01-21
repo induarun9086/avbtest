@@ -309,7 +309,10 @@ int main(int argc, char* argv[])
 	cfg.timestamp = 0;
         memcpy(&cfg.devname, "stereo4", strlen("stereo4")+1);
 	initAndStartThread(T1, 50, &cfg, startPlayback, 1);
-        waitForThreads(2);
+	cfg.numchannels = 4; memcpy(&cfg.filename, "r042.wav", strlen("r042.wav")+1);
+        memcpy(&cfg.devname, "hw:CARD=C8CH,0", strlen("hw:CARD=C8CH,0")+1);
+        initAndStartThread(T2, 50, &cfg, startRecord, 0);
+        waitForThreads(3);
     } else if(cfg.mode == AVB_TEST_MODE_AVB_DEMO_RX_2) {
         printf("avbtest: Demo mode b %d frames from file %s (ch: %d sr: %d) \n", cfg.maxframes, cfg.filename, cfg.numchannels, cfg.samplerate);
         memcpy(&cfg.devname, "stereo2", strlen("stereo2")+1);
@@ -362,7 +365,7 @@ void* startPlayback(void* argument)
     snd_hwdep_t* hwdep;
     snd_pcm_uframes_t ringbufsize;
     snd_pcm_uframes_t periodsize;
-    struct timespec t, t1, t2, d;
+    struct timespec t, t1, t2, d, tp;
     struct threadargs* arg = (struct threadargs*)argument;
 
     if(arg->cfg.tobuf == 0){
@@ -487,6 +490,14 @@ void* startPlayback(void* argument)
             snd_hwdep_ioctl(hwdep, 0, (void*)ts);
 	}
 
+
+	if(numFrames == 0) {
+		if(arg->cfg.dbgLvl >= AVB_TEST_DBG_LVL_INFO) {
+			clock_gettime(arg->cfg.clkId, &tp);
+			printf("t%d: First frame transferred @ %d s %d ns \n");
+		}	
+	}
+
         sentFrames = snd_pcm_writei(handle, &buf[arg->id][0], readFrames);
 
         if(sentFrames < 0)
@@ -544,6 +555,7 @@ void* startRecord(void* argument)
     struct wavhdr hdr;
     unsigned long ts = 0;
     snd_hwdep_t* hwdep;
+    struct timespec tp;
     snd_pcm_uframes_t ringbufsize;
      snd_pcm_uframes_t periodsize;
     unsigned char tmpfile[AVB_TEST_MAX_FILE_NAME_SIZE] = {0};
@@ -611,6 +623,13 @@ void* startRecord(void* argument)
         readBytes  = readFrames * hdr.numchannels * (hdr.bps / 8);
 
         rcvdFrames = snd_pcm_readi(handle, &buf[arg->id][0], readFrames);
+
+	if((numFrames == 0) && (rcvdFrames > 0)) {
+		if(arg->cfg.dbgLvl >= AVB_TEST_DBG_LVL_INFO) {
+			clock_gettime(arg->cfg.clkId, &tp);
+			printf("t%d: First frame received @ %d s %d ns \n");
+		}	
+	}
 
         if(rcvdFrames < 0) {
             rcvdFrames = snd_pcm_recover(handle, rcvdFrames, 0);

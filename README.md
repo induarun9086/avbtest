@@ -51,3 +51,6 @@ Test application for the ALSA AVB driver.
 * The beagle bone black in the transmit mode should have a analog audio card connected.
 * 2 Channels of the analog audio card are connected to a test PC.
 
+**License**
+
+MIT License Copyright (c) [2018] [Indumathi Duraipandian]
